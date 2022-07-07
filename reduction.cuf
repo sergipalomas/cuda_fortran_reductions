@@ -1,0 +1,253 @@
+MODULE cuda_fortran
+CONTAINS
+    ATTRIBUTES(global) SUBROUTINE reductionv1(invec, N, outvec)
+        IMPLICIT NONE
+        REAL(kind=8), DIMENSION(:) :: invec, outvec
+        REAL(kind=8), SHARED :: sdata(*)
+        INTEGER, VALUE :: N
+        INTEGER :: ti, i, stride
+        
+        ti = threadIdx%x
+        i = blockDim%x * (blockIdx%x - 1) + threadIdx%x
+        
+        IF ( i .le. N ) THEN
+            sdata(ti) = invec(i)
+            CALL syncthreads()
+        
+            stride = 1
+            DO WHILE (stride <= blockDim%x/2)
+                IF(MOD(ti-1, (2*stride)) .eq. 0) THEN
+                    sdata(ti) = sdata(ti) + sdata(ti + stride)
+                END IF
+                stride = ishft(stride, 1)
+                CALL syncthreads()
+            END DO
+        
+            IF ( ti .eq. 1 ) outvec(blockIdx%x) = sdata(ti)
+         END IF
+
+    END SUBROUTINE reductionv1
+    
+
+    !Interleaved Addressing
+    ATTRIBUTES(global) SUBROUTINE reductionv2(invec, N, outvec)
+        IMPLICIT NONE
+        REAL(kind=8), DIMENSION(:) :: invec, outvec
+        REAL(kind=8), SHARED :: sdata(*)
+        INTEGER, VALUE :: N
+        INTEGER :: tid, i, stride, idx
+        
+        tid = threadIdx%x
+        i = blockDim%x * (blockIdx%x - 1) + threadIdx%x
+        
+        IF ( i .le. N ) THEN
+            sdata(tid) = invec(i)
+            CALL syncthreads()
+        
+            stride = 1
+            DO WHILE (stride <= blockDim%x/2)
+                !Replace divergent branch inner loop sith strided index and non-divergent branch
+                idx = 1+(2 * stride * (tid-1))
+                IF( idx < blockDim%x) THEN
+                    sdata(idx) = sdata(idx) + sdata(idx + stride)
+                END IF
+                stride = ishft(stride, 1)
+                CALL syncthreads()
+            END DO
+        
+            IF ( tid .eq. 1 ) outvec(blockIdx%x) = sdata(tid)
+         END IF
+
+    END SUBROUTINE reductionv2
+
+    !Sequential Addressing
+    ATTRIBUTES(global) SUBROUTINE reductionv3(invec, N, outvec)
+        IMPLICIT NONE
+        REAL(kind=8), DIMENSION(:) :: invec, outvec
+        REAL(kind=8), SHARED :: sdata(*)
+        INTEGER, VALUE :: N
+        INTEGER :: tid, i, stride, idx
+        
+        tid = threadIdx%x
+        i = blockDim%x * (blockIdx%x - 1) + threadIdx%x
+        
+        IF ( i .le. N ) THEN
+            sdata(tid) = invec(i)
+            CALL syncthreads()
+        
+            stride = blockDim%x/2
+            !Replace strided indexin with reversed loop and threadID-based indexing
+            DO WHILE (stride > 0)
+                IF( tid <= stride) THEN
+                    sdata(tid) = sdata(tid) + sdata(tid + stride)
+                END IF
+                stride = rshift(stride, 1)
+                CALL syncthreads()
+            END DO
+        
+            IF ( tid .eq. 1 ) outvec(blockIdx%x) = sdata(tid)
+         END IF
+
+    END SUBROUTINE reductionv3
+    
+    !Sequential Addressing
+    ATTRIBUTES(global) SUBROUTINE reductionv4(invec, N, outvec)
+        IMPLICIT NONE
+        REAL(kind=8), DIMENSION(:) :: invec, outvec
+        REAL(kind=8), SHARED :: sdata(*)
+        INTEGER, VALUE :: N
+        INTEGER :: tid, i, stride, idx
+        
+        tid = threadIdx%x
+        i = blockDim%x*2 * (blockIdx%x - 1) + threadIdx%x
+        
+        IF ( i .le. N ) THEN
+            sdata(tid) = invec(i) + invec(i+blockDim%x)
+            CALL syncthreads()
+        
+            stride = blockDim%x/2
+            !Replace strided indexin with reversed loop and threadID-based indexing
+            DO WHILE (stride > 0)
+                IF( tid <= stride) THEN
+                    sdata(tid) = sdata(tid) + sdata(tid + stride)
+                END IF
+                stride = rshift(stride, 1)
+                CALL syncthreads()
+            END DO
+        
+            IF ( tid .eq. 1 ) outvec(blockIdx%x) = sdata(tid)
+         END IF
+
+    END SUBROUTINE reductionv4
+   
+    !Unroll the last Warp
+    ATTRIBUTES(global) SUBROUTINE reductionv5(invec, N, outvec)
+        IMPLICIT NONE
+        REAL(kind=8), DIMENSION(:) :: invec, outvec
+        REAL(kind=8), VOLATILE, SHARED :: sdata(*)
+        INTEGER, VALUE :: N
+        INTEGER :: tid, i, stride, idx
+        
+        tid = threadIdx%x
+        i = blockDim%x*2 * (blockIdx%x - 1) + threadIdx%x
+        
+        IF ( i .le. N ) THEN
+            sdata(tid) = invec(i) + invec(i+blockDim%x)
+            CALL syncthreads()
+        
+            stride = blockDim%x/2
+            DO WHILE (stride > 32)
+                IF( tid <= stride) THEN
+                    sdata(tid) = sdata(tid) + sdata(tid + stride)
+                END IF
+                stride = rshift(stride, 1)
+                CALL syncthreads()
+            END DO
+            
+            IF ( tid <= 32 ) THEN
+                sdata(tid) = sdata(tid) + sdata(tid + 32)
+                sdata(tid) = sdata(tid) + sdata(tid + 16)
+                sdata(tid) = sdata(tid) + sdata(tid + 8)
+                sdata(tid) = sdata(tid) + sdata(tid + 4)
+                sdata(tid) = sdata(tid) + sdata(tid + 2)
+                sdata(tid) = sdata(tid) + sdata(tid + 1)
+            END IF
+        
+            IF ( tid .eq. 1 ) outvec(blockIdx%x) = sdata(tid)
+         END IF
+
+    END SUBROUTINE reductionv5        
+    
+
+    ATTRIBUTES(global) SUBROUTINE reductionv6(invec, N, outvec)
+        IMPLICIT NONE
+        REAL(kind=8), DIMENSION(:) :: invec, outvec
+        REAL(kind=8), SHARED :: sdata(*)
+        INTEGER, VALUE :: N
+        INTEGER :: tid, i, stride, idx, gridSize
+        
+        tid = threadIdx%x
+        i = blockDim%x*2 * (blockIdx%x - 1) + threadIdx%x
+        gridSize = blockDim%x * 2 * gridDim%x
+        
+        sdata(tid) = 0
+        
+        DO WHILE ( i < N )
+            sdata(tid) = sdata(tid) + invec(i) + invec(i+blockDim%x)
+            i = i + gridSize
+        END DO
+        CALL syncthreads()
+        
+        stride = blockDim%x/2
+        !Replace strided indexin with reversed loop and threadID-based indexing
+        DO WHILE (stride > 0)
+            IF( tid <= stride) THEN
+                sdata(tid) = sdata(tid) + sdata(tid + stride)
+            END IF
+            stride = rshift(stride, 1)
+            CALL syncthreads()
+        END DO
+    
+        IF ( tid .eq. 1 ) outvec(blockIdx%x) = sdata(tid)
+
+    END SUBROUTINE reductionv6
+
+END MODULE cuda_fortran
+
+
+program cuda_reductions
+    USE cuda_fortran
+    USE cudafor
+    IMPLICIT NONE
+    INTEGER, SAVE :: N = 1000000
+    REAL(kind=8) :: cpu_sum, gpu_sum, start, finish
+    INTEGER ::  iterator, ierr
+    REAL(kind=8), DIMENSION(:), ALLOCATABLE , PINNED ::   ind, outd
+
+    ! Device data 
+    REAL(kind=8), DEVICE, ALLOCATABLE , DIMENSION(:) :: d_ind, d_outd
+
+    ! dim3 variables
+    type(dim3) :: dimGrid, dimBlock
+
+    allocate(ind(N), outd(N))
+
+    
+    ! Initialization
+    call RANDOM_NUMBER(ind)
+    outd = 0
+    cpu_sum = sum(ind)
+    
+    allocate(d_ind(N), d_outd(N))
+    d_ind = ind
+    d_outd = 0
+    
+    print *, "Start reduction for ", N, " elements of ", sizeof(ind)/N "bytes each"
+    iterator = N
+    DO WHILE ( iterator .gt. 1 )
+        print *, iterator , "remaining elements"
+        dimBlock = dim3(256, 1, 1)
+        dimGrid = dim3(ceiling(real(iterator)/dimBlock%x), 1, 1)
+        !Change dimGrid after v4 (incl)
+        !dimGrid = dim3(ceiling(real(ceiling(real(iterator)/dimBlock%x))/2), 1, 1)
+        CALL reductionv1<<<dimGrid, dimBlock, 8*dimBlock%x>>>(d_ind, iterator, d_outd)
+        iterator = dimGrid%x
+        d_ind = 0
+        ierr = cudaMemcpy(d_ind, d_outd, iterator)
+        d_outd(1:iterator) = 0
+    END DO
+
+    ierr = cudaMemcpy(outd, d_ind, 1)
+    gpu_sum = outd(1)
+    print *, "End reduction"
+
+    print *, "CPU sum: ", cpu_sum
+    print *, "GPU sum: ", gpu_sum
+    if (cpu_sum .ne. gpu_sum) then
+        print *, "CPU and GPU results differ"
+    if(allocated(ind))  deallocate(ind)
+    if(allocated(outd)) deallocate(outd)
+    ierr = cudafree(d_ind)
+    ierr = cudafree(d_outd)
+END
+
